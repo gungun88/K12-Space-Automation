@@ -34,13 +34,187 @@ K12 Space Automation 是一个本地运行的 K12 workspace 自动化控制台, 
 
 ## 安装启动
 
-安装依赖:
+### 1. Ubuntu/VPS 从零准备
+
+以下步骤默认面向一台全新的 Ubuntu 服务器. 如果你在本机开发, 可以跳到“本机开发模式”.
+
+先登录服务器, 安装基础工具:
+
+```bash
+sudo apt update
+sudo apt install -y git curl ca-certificates
+```
+
+安装 Node.js 22 和 npm. 这里使用 NodeSource 的 Node.js 22.x APT 源, 如服务器已经安装 Node.js 20+ 可以只执行版本检查:
+
+```bash
+curl -fsSL https://deb.nodesource.com/setup_22.x -o /tmp/nodesource_setup.sh
+sudo -E bash /tmp/nodesource_setup.sh
+sudo apt install -y nodejs
+
+node -v
+npm -v
+```
+
+版本要求:
+
+- `node -v` 应为 `v20.x` 或更高, 推荐 `v22.x`.
+- `npm -v` 应为 `10.x` 或更高.
+
+NodeSource 安装脚本参考: <https://github.com/nodesource/distributions/blob/master/DEV_README.md>.
+
+### 2. 拉取项目代码
+
+本仓库是私有仓库, 服务器需要先具备访问 `BFanSYe/K12-Space-Automation` 的 GitHub 权限. 可以使用 GitHub HTTPS token, GitHub CLI 登录, 或 SSH key.
+
+HTTPS 方式:
+
+```bash
+mkdir -p ~/apps
+cd ~/apps
+git clone https://github.com/BFanSYe/K12-Space-Automation.git
+cd K12-Space-Automation
+```
+
+SSH 方式:
+
+```bash
+mkdir -p ~/apps
+cd ~/apps
+git clone git@github.com:BFanSYe/K12-Space-Automation.git
+cd K12-Space-Automation
+```
+
+如果 `git clone` 提示无权限, 先检查服务器上的 GitHub 凭据, 不要把 GitHub token 写进仓库文件.
+
+### 3. 安装依赖并构建
 
 ```bash
 npm install
+npm run build
 ```
 
-开发模式同时启动 API 服务和 Web 控制台:
+`npm run build` 会执行类型检查并生成 `dist/` 前端产物. 生产模式必须先构建, 否则访问页面可能出现 404.
+
+### 4. 前台启动验证
+
+```bash
+npm run start
+```
+
+看到类似输出即表示 API 服务已启动:
+
+```text
+K12 console API listening: http://0.0.0.0:8796/
+```
+
+默认访问地址:
+
+- 服务器本机: `http://127.0.0.1:8796/`
+- 其他电脑访问: `http://服务器IP:8796/`
+
+生产模式下, `npm run start` 会由 API 服务直接托管构建后的 `dist/`, 默认只需要开放 `8796` 端口. `5174` 是 Vite 开发服务端口, 生产部署通常不需要开放.
+
+如果浏览器无法访问:
+
+```bash
+curl http://127.0.0.1:8796/api/health
+sudo ufw allow 8796/tcp
+sudo ufw status
+```
+
+还需要确认云服务器控制台的安全组或防火墙已放行 TCP `8796`.
+
+### 5. 使用 PM2 后台常驻运行
+
+安装 PM2:
+
+```bash
+sudo npm install -g pm2
+```
+
+在项目根目录启动服务:
+
+```bash
+cd ~/apps/K12-Space-Automation
+pm2 start npm --name k12-space-automation -- run start
+```
+
+常用管理命令:
+
+```bash
+pm2 status
+pm2 logs k12-space-automation
+pm2 restart k12-space-automation
+pm2 stop k12-space-automation
+```
+
+配置开机自启:
+
+```bash
+pm2 save
+pm2 startup
+```
+
+`pm2 startup` 会输出一条以 `sudo env ...` 开头的命令, 按输出复制执行一次即可.
+
+更新代码后的推荐流程:
+
+```bash
+cd ~/apps/K12-Space-Automation
+git pull
+npm install
+npm run build
+pm2 restart k12-space-automation
+```
+
+如需改端口, 可以在启动时设置 `PORT`:
+
+```bash
+PORT=8899 pm2 start npm --name k12-space-automation -- run start
+```
+
+### 6. 可选: Nginx 域名反向代理
+
+如果只通过 `http://服务器IP:8796/` 使用, 可以跳过本节. 如果需要域名访问, 可以用 Nginx 反代到本地 `8796`.
+
+安装 Nginx:
+
+```bash
+sudo apt install -y nginx
+```
+
+创建站点配置, 将 `example.com` 替换为你的域名:
+
+```bash
+sudo tee /etc/nginx/sites-available/k12-space-automation >/dev/null <<'NGINX'
+server {
+    listen 80;
+    server_name example.com;
+
+    client_max_body_size 50m;
+
+    location / {
+        proxy_pass http://127.0.0.1:8796;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+NGINX
+
+sudo ln -sf /etc/nginx/sites-available/k12-space-automation /etc/nginx/sites-enabled/k12-space-automation
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+此时访问 `http://example.com/` 应能打开控制台. 如需 HTTPS, 可以在 Nginx 配置完成后使用 certbot 或已有证书补齐 TLS.
+
+### 7. 本机开发模式
+
+开发模式会同时启动 API 服务和 Vite 前端服务:
 
 ```bash
 npm run dev
@@ -51,6 +225,8 @@ npm run dev
 - Web 控制台: `http://127.0.0.1:5174/`
 - API 服务: `http://127.0.0.1:8796/`
 
+Vite 会把 `/api` 请求代理到 `8796`. 该模式适合开发调试, 不建议作为 VPS 长期生产部署方式.
+
 常用脚本:
 
 ```bash
@@ -58,8 +234,32 @@ npm run server    # 只启动本地 API 服务
 npm run frontend  # 只启动 Vite Web 控制台
 npm run build     # 类型检查并构建前端产物
 npm run preview   # 预览构建产物
-npm run start     # 启动本地 API 服务
+npm run start     # 启动本地 API 服务并托管 dist/
 ```
+
+### 8. 首次配置与部署常见问题
+
+第一次启动后, 打开 Web 控制台, 在 Settings 中填写代理, workspace, Sub2API, 接码和 JSON 写出配置. 保存后会生成本地运行配置:
+
+- `data/config.json`
+- `config.json`
+
+如需使用 `codex_register/` 下的独立工具, 再复制模板:
+
+```bash
+cp codex_register/config.example.json codex_register/config.json
+```
+
+不要把真实配置提交到 Git, 包括 token, cookie, mailbox refresh token, account JSON, `config.json`, `data/`, `json/`, `pool_tokens.txt`.
+
+常见问题:
+
+- `npm: command not found`: Node.js/npm 没装好, 重新执行 Node.js 安装步骤并确认 `node -v`, `npm -v`.
+- `Cannot find module`: 依赖不完整, 在项目根目录重新执行 `npm install`.
+- 页面 404 或空白: 生产模式下先执行 `npm run build`, 再 `npm run start` 或重启 PM2.
+- 访问不到页面: 检查 `pm2 status`, `pm2 logs k12-space-automation`, `curl http://127.0.0.1:8796/api/health`, 安全组和防火墙.
+- 端口占用: 换 `PORT`, 或停止占用 `8796` 的进程.
+- PM2 启动后找不到配置: 确认是在项目根目录执行 `pm2 start`, 不要从其他目录启动.
 
 ## 基础配置
 

@@ -34,13 +34,187 @@ This repository contains source code, documentation, configuration templates, an
 
 ## Install and Run
 
-Install dependencies:
+### 1. Prepare a Fresh Ubuntu/VPS Server
+
+The steps below target a fresh Ubuntu server. For local development, skip to “Local Development Mode”.
+
+Install basic tools:
+
+```bash
+sudo apt update
+sudo apt install -y git curl ca-certificates
+```
+
+Install Node.js 22 and npm with the NodeSource Node.js 22.x APT repository. If your server already has Node.js 20+, you may only run the version checks:
+
+```bash
+curl -fsSL https://deb.nodesource.com/setup_22.x -o /tmp/nodesource_setup.sh
+sudo -E bash /tmp/nodesource_setup.sh
+sudo apt install -y nodejs
+
+node -v
+npm -v
+```
+
+Requirements:
+
+- `node -v` should be `v20.x` or newer, `v22.x` recommended.
+- `npm -v` should be `10.x` or newer.
+
+NodeSource reference: <https://github.com/nodesource/distributions/blob/master/DEV_README.md>.
+
+### 2. Clone the Repository
+
+This is a private repository. The server must have GitHub access to `BFanSYe/K12-Space-Automation` through an HTTPS token, GitHub CLI login, or an SSH key.
+
+HTTPS:
+
+```bash
+mkdir -p ~/apps
+cd ~/apps
+git clone https://github.com/BFanSYe/K12-Space-Automation.git
+cd K12-Space-Automation
+```
+
+SSH:
+
+```bash
+mkdir -p ~/apps
+cd ~/apps
+git clone git@github.com:BFanSYe/K12-Space-Automation.git
+cd K12-Space-Automation
+```
+
+If `git clone` fails with a permission error, fix the GitHub credentials on the server. Do not write GitHub tokens into repository files.
+
+### 3. Install Dependencies and Build
 
 ```bash
 npm install
+npm run build
 ```
 
-Start the API server and web console in development mode:
+`npm run build` runs type checks and creates the `dist/` frontend bundle. Production mode requires this build; otherwise the web page may return 404.
+
+### 4. Foreground Smoke Test
+
+```bash
+npm run start
+```
+
+A successful startup prints output similar to:
+
+```text
+K12 console API listening: http://0.0.0.0:8796/
+```
+
+Default URLs:
+
+- On the server: `http://127.0.0.1:8796/`
+- From another machine: `http://SERVER_IP:8796/`
+
+In production mode, `npm run start` serves the built `dist/` frontend directly from the API server. Only port `8796` is needed by default. Port `5174` is for the Vite development server and usually should not be exposed in production.
+
+If the page is not reachable:
+
+```bash
+curl http://127.0.0.1:8796/api/health
+sudo ufw allow 8796/tcp
+sudo ufw status
+```
+
+Also confirm that your cloud security group allows TCP `8796`.
+
+### 5. Run in the Background with PM2
+
+Install PM2:
+
+```bash
+sudo npm install -g pm2
+```
+
+Start the service from the project root:
+
+```bash
+cd ~/apps/K12-Space-Automation
+pm2 start npm --name k12-space-automation -- run start
+```
+
+Common commands:
+
+```bash
+pm2 status
+pm2 logs k12-space-automation
+pm2 restart k12-space-automation
+pm2 stop k12-space-automation
+```
+
+Enable startup on boot:
+
+```bash
+pm2 save
+pm2 startup
+```
+
+`pm2 startup` prints a `sudo env ...` command. Copy and run that command once.
+
+Recommended update flow:
+
+```bash
+cd ~/apps/K12-Space-Automation
+git pull
+npm install
+npm run build
+pm2 restart k12-space-automation
+```
+
+To change the port, set `PORT` when starting the process:
+
+```bash
+PORT=8899 pm2 start npm --name k12-space-automation -- run start
+```
+
+### 6. Optional: Nginx Reverse Proxy
+
+Skip this section if `http://SERVER_IP:8796/` is enough. For domain-based access, proxy Nginx to local port `8796`.
+
+Install Nginx:
+
+```bash
+sudo apt install -y nginx
+```
+
+Create a site configuration. Replace `example.com` with your domain:
+
+```bash
+sudo tee /etc/nginx/sites-available/k12-space-automation >/dev/null <<'NGINX'
+server {
+    listen 80;
+    server_name example.com;
+
+    client_max_body_size 50m;
+
+    location / {
+        proxy_pass http://127.0.0.1:8796;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+NGINX
+
+sudo ln -sf /etc/nginx/sites-available/k12-space-automation /etc/nginx/sites-enabled/k12-space-automation
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+`http://example.com/` should now open the console. For HTTPS, add TLS with certbot or your existing certificates after the reverse proxy works.
+
+### 7. Local Development Mode
+
+Development mode starts both the API server and the Vite frontend server:
 
 ```bash
 npm run dev
@@ -51,6 +225,8 @@ Default URLs:
 - Web console: `http://127.0.0.1:5174/`
 - API server: `http://127.0.0.1:8796/`
 
+Vite proxies `/api` requests to `8796`. This mode is for development and debugging, not long-running VPS production deployments.
+
 Common scripts:
 
 ```bash
@@ -58,8 +234,32 @@ npm run server    # Start the local API server only
 npm run frontend  # Start the Vite web console only
 npm run build     # Type-check and build the frontend
 npm run preview   # Preview the built frontend
-npm run start     # Start the local API server
+npm run start     # Start the local API server and serve dist/
 ```
+
+### 8. First Configuration and Troubleshooting
+
+After the first startup, open the web console and fill Settings for proxy, workspace, Sub2API, OTP, and JSON output. Saved runtime configuration is written to:
+
+- `data/config.json`
+- `config.json`
+
+For standalone tools under `codex_register/`, copy the template when needed:
+
+```bash
+cp codex_register/config.example.json codex_register/config.json
+```
+
+Do not commit real configuration or runtime data, including tokens, cookies, mailbox refresh tokens, account JSON files, `config.json`, `data/`, `json/`, or `pool_tokens.txt`.
+
+Common issues:
+
+- `npm: command not found`: Node.js/npm is not installed or not on `PATH`; rerun the Node.js installation steps and check `node -v`, `npm -v`.
+- `Cannot find module`: dependencies are incomplete; rerun `npm install` from the project root.
+- 404 or blank page: run `npm run build` before `npm run start` or restart PM2 after rebuilding.
+- Page unreachable: check `pm2 status`, `pm2 logs k12-space-automation`, `curl http://127.0.0.1:8796/api/health`, security groups, and firewall rules.
+- Port already in use: set another `PORT` or stop the process using `8796`.
+- PM2 cannot find local configuration: start PM2 from the project root, not another directory.
 
 ## Configuration
 
