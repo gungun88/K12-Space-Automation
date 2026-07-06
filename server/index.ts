@@ -424,6 +424,21 @@ function decodeJwtPayload(token: string): Record<string, unknown> {
   }
 }
 
+function jwtAuthObject(payload: Record<string, unknown>): Record<string, unknown> {
+  const auth = payload["https://api.openai.com/auth"];
+  return auth && typeof auth === "object" && !Array.isArray(auth) ? auth as Record<string, unknown> : {};
+}
+
+function jwtChatGptAccountId(payload: Record<string, unknown>): string {
+  const auth = jwtAuthObject(payload);
+  return asString(payload["https://api.openai.com/auth.chatgpt_account_id"] || auth.chatgpt_account_id || payload.chatgpt_account_id);
+}
+
+function jwtChatGptPlanType(payload: Record<string, unknown>): string {
+  const auth = jwtAuthObject(payload);
+  return asString(payload["https://api.openai.com/auth.chatgpt_plan_type"] || auth.chatgpt_plan_type || payload.chatgpt_plan_type);
+}
+
 function decodeBase64UrlJson(value: string): unknown {
   const normalized = value.replace(/-/g, "+").replace(/_/g, "/");
   const padded = normalized.padEnd(Math.ceil(normalized.length / 4) * 4, "=");
@@ -433,15 +448,14 @@ function decodeBase64UrlJson(value: string): unknown {
 function summarizeToken(token: string): {hash: string; preview: string; email: string; expiresAt: string; accountId: string; planType: string} {
   const payload = decodeJwtPayload(token);
   const profile = (payload["https://api.openai.com/profile"] || {}) as Record<string, unknown>;
-  const auth = (payload["https://api.openai.com/auth"] || {}) as Record<string, unknown>;
   const exp = Number(payload.exp || 0);
   return {
     hash: tokenHash(token),
     preview: tokenPreview(token),
     email: asString(profile.email || payload.email),
     expiresAt: exp > 0 ? new Date(exp * 1000).toISOString() : "",
-    accountId: asString(auth.chatgpt_account_id),
-    planType: asString(auth.chatgpt_plan_type),
+    accountId: jwtChatGptAccountId(payload),
+    planType: jwtChatGptPlanType(payload),
   };
 }
 
@@ -3386,6 +3400,7 @@ function hasSuccessfulWorkspaceInvite(task: K12Task, workspaceId: string): boole
 function retryWorkspaceIdsForTask(source: K12Task, email: EmailRecord): string[] {
   const workspaceIds = targetK12WorkspaceIds(source);
   if (workspaceIds.length <= 1) return workspaceIds;
+  if (source.sub2apiNoRtMode === true && source.runSub2Api) return workspaceIds;
   const missing = workspaceIds.filter((workspaceId) => !workspaceExported(source, email, workspaceId));
   return missing.length ? missing : workspaceIds;
 }
@@ -3405,6 +3420,74 @@ async function readChatGptSessionAccessToken(client: any, task: K12Task, reason:
   appendLog(task, "info", `当前 Web AT 上下文: ${describeAccessTokenContext(token)}`);
   await cacheLoginBaseWorkspaceFromAccessToken(emailForTask(task), task, token);
   return token;
+}
+
+function extractChatGptSessionAccessToken(payload: unknown): string {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    throw new Error("ChatGPT session exchange 响应不是 JSON 对象");
+  }
+  const record = payload as Record<string, unknown>;
+  const directToken = asString(record.accessToken || record.access_token);
+  if (directToken) return directToken;
+
+  const tokens = record.tokens;
+  if (tokens && typeof tokens === "object" && !Array.isArray(tokens)) {
+    const nestedToken = asString((tokens as Record<string, unknown>).access_token);
+    if (nestedToken) return nestedToken;
+  }
+
+  throw new Error("ChatGPT session exchange 响应缺少 accessToken/access_token/tokens.access_token");
+}
+
+async function exchangeChatGptWorkspaceSessionToken(
+  client: any,
+  task: K12Task,
+  workspaceId: string,
+): Promise<string> {
+  const normalizedWorkspaceId = normalizeWorkspaceId(workspaceId);
+  if (!normalizedWorkspaceId) {
+    throw new Error(`workspace_id 格式无效，无法 session exchange: ${workspaceId}`);
+  }
+
+  appendLog(task, "info", `使用 ChatGPT session exchange 获取 workspace AT: ${normalizedWorkspaceId.slice(0, 8)}...`);
+  const url = new URL(`${CHATGPT_BASE_URL}/api/auth/session`);
+  url.searchParams.set("exchange_workspace_token", "true");
+  url.searchParams.set("workspace_id", normalizedWorkspaceId);
+  url.searchParams.set("reason", "setCurrentAccount");
+
+  const response = await client.fetch(url.toString(), {
+    method: "GET",
+    headers: oauthBrowserHeaders(client, {
+      accept: "application/json,*/*;q=0.8",
+      referer: `${CHATGPT_BASE_URL}/`,
+      "sec-fetch-dest": "empty",
+      "sec-fetch-mode": "cors",
+      "sec-fetch-site": "same-origin",
+    }),
+  });
+  const text = await response.text().catch(() => "");
+  if (!response.ok) {
+    throw new Error(`ChatGPT session exchange 失败 workspace=${normalizedWorkspaceId}: HTTP ${response.status}: ${text.slice(0, 500)}`);
+  }
+
+  let payload: unknown;
+  try {
+    payload = JSON.parse(text) as unknown;
+  } catch {
+    throw new Error(`ChatGPT session exchange 非 JSON 响应 workspace=${normalizedWorkspaceId}: ${text.slice(0, 500)}`);
+  }
+
+  const accessToken = extractChatGptSessionAccessToken(payload);
+  const jwtPayload = decodeJwtPayload(accessToken);
+  const tokenWorkspaceId = jwtChatGptAccountId(jwtPayload);
+  if (!sameWorkspaceId(tokenWorkspaceId, normalizedWorkspaceId)) {
+    throw new Error(
+      `ChatGPT session exchange 返回的 AT workspace 不匹配: expected=${normalizedWorkspaceId}, actual=${tokenWorkspaceId || "?"}, ${describeAccessTokenContext(accessToken)}`,
+    );
+  }
+
+  appendLog(task, "ok", `session exchange 已确认 workspace AT: ${normalizedWorkspaceId.slice(0, 8)}...`);
+  return accessToken;
 }
 
 function findWorkspaceInAccountsCheck(payload: unknown, workspaceId: string): Record<string, unknown> | null {
@@ -3823,14 +3906,14 @@ async function ensureK12AccessTokenForNoRt(client: any, task: K12Task, accessTok
 
 function buildSub2ApiCredentialsFromAccessToken(accessToken: string, fallbackEmail: string): Record<string, unknown> {
   const payload = decodeJwtPayload(accessToken);
-  const auth = (payload["https://api.openai.com/auth"] || {}) as Record<string, unknown>;
+  const auth = jwtAuthObject(payload);
   const profile = (payload["https://api.openai.com/profile"] || {}) as Record<string, unknown>;
   const credentials: Record<string, unknown> = {
     access_token: accessToken,
     email: asString(profile.email || payload.email, fallbackEmail),
-    chatgpt_account_id: asString(auth.chatgpt_account_id),
+    chatgpt_account_id: jwtChatGptAccountId(payload),
     chatgpt_user_id: normalizeChatGptUserId(auth),
-    plan_type: asString(auth.chatgpt_plan_type),
+    plan_type: jwtChatGptPlanType(payload),
     client_id: asString(payload.client_id, "app_X8zY6vW2pQ9tR3dE7nK1jL5gH"),
   };
   for (const key of Object.keys(credentials)) {
@@ -5856,6 +5939,25 @@ async function runK12WorkspaceJoinForWorkspace(
   return runK12WorkspaceSwitchAndRecordForWorkspace(client, task, email, baseAccessToken, workspaceId);
 }
 
+async function runK12WorkspaceJoinAndExchangeForWorkspace(
+  client: any,
+  task: K12Task,
+  email: EmailRecord,
+  baseAccessToken: string,
+  workspaceId: string,
+): Promise<string> {
+  if (!baseAccessToken) {
+    throw new Error("K12 空间执行需要 AT：请先建立 ChatGPT Web session 后从 /api/auth/session 获取 accessToken");
+  }
+
+  await runK12WorkspaceInviteForWorkspace(client, task, baseAccessToken, workspaceId, {email});
+  await checkK12WorkspaceMembership(client, task, baseAccessToken, workspaceId, email);
+  const workspaceToken = await exchangeChatGptWorkspaceSessionToken(client, task, workspaceId);
+  recordAccessToken(task, email, workspaceToken);
+  await appendTokenOut(workspaceToken);
+  return workspaceToken;
+}
+
 async function runK12WorkspaceInviteForWorkspace(
   client: any,
   task: K12Task,
@@ -5934,7 +6036,8 @@ async function runNoRtWorkspaceBatchTwoPhase(
     throw new Error("K12 空间执行需要 AT：请启用 Sub2API OAuth，或先建立 ChatGPT Web session 后从 /api/auth/session 获取 accessToken");
   }
 
-  appendLog(task, "info", `Sub2API noRT 两阶段批处理模式：先集中申请 ${workspaceIds.length} 个 workspace，再逐个导出入库`);
+  appendLog(task, "info", "noRT workspace token 模式: chatgpt session exchange, 禁用 auth callback workspace 切换");
+  appendLog(task, "info", `Sub2API noRT 批处理模式：阶段 1 集中申请 ${workspaceIds.length} 个 workspace`);
   await refreshVisibleWorkspacesFromAccountsCheck(client, task, email, baseAccessToken, "K12 申请阶段开始");
   for (let workspaceIndex = 0; workspaceIndex < workspaceIds.length; workspaceIndex += 1) {
     assertNotCanceled(task);
@@ -5944,31 +6047,29 @@ async function runNoRtWorkspaceBatchTwoPhase(
   }
   appendLog(task, "ok", `K12 申请阶段完成: ${workspaceIds.length}/${workspaceIds.length}`);
 
-  let latestToken = baseAccessToken;
-  let exportedCount = 0;
-  let skippedCount = 0;
+  const collected: {workspaceId: string; accessToken: string}[] = [];
+  appendLog(task, "info", `Sub2API noRT 批处理模式：阶段 2 使用 session exchange 获取 ${workspaceIds.length} 个 workspace AT`);
   for (let workspaceIndex = 0; workspaceIndex < workspaceIds.length; workspaceIndex += 1) {
     assertNotCanceled(task);
     const workspaceId = workspaceIds[workspaceIndex];
-    const expectedAccountName = expectedWorkspaceAccountName(task, email, workspaceId);
-    if (workspaceExported(task, email, workspaceId)) {
-      skippedCount += 1;
-      appendLog(
-        task,
-        "info",
-        `K12 导出阶段: ${workspaceIndex + 1}/${workspaceIds.length} ${workspaceId} JSON 已存在，跳过 Sub2API noRT 入库和 JSON 导出: ${expectedAccountName}`,
-      );
-      continue;
-    }
-
-    appendLog(task, "info", `K12 导出阶段: ${workspaceIndex + 1}/${workspaceIds.length} ${workspaceId}`);
-    const workspaceToken = await runK12WorkspaceSwitchAndRecordForWorkspace(client, task, email, baseAccessToken, workspaceId);
-    await upsertAndExportNoRtWorkspaceToken(task, email, workspaceToken, "gpt-k12-nort");
-    latestToken = workspaceToken;
-    exportedCount += 1;
+    appendLog(task, "info", `K12 token exchange 阶段: ${workspaceIndex + 1}/${workspaceIds.length} ${workspaceId}`);
+    await checkK12WorkspaceMembership(client, task, baseAccessToken, workspaceId, email);
+    const workspaceToken = await exchangeChatGptWorkspaceSessionToken(client, task, workspaceId);
+    recordAccessToken(task, email, workspaceToken);
+    await appendTokenOut(workspaceToken);
+    collected.push({workspaceId, accessToken: workspaceToken});
   }
-  appendLog(task, "ok", `K12 导出阶段完成: 新导出 ${exportedCount} 个，跳过 ${skippedCount} 个`);
-  return latestToken;
+  appendLog(task, "ok", `K12 token exchange 阶段完成: ${collected.length}/${workspaceIds.length}`);
+
+  appendLog(task, "info", `Sub2API noRT 批处理模式：阶段 3 统一 upsert 并覆盖写出 JSON ${collected.length} 个 workspace`);
+  for (let itemIndex = 0; itemIndex < collected.length; itemIndex += 1) {
+    assertNotCanceled(task);
+    const item = collected[itemIndex];
+    appendLog(task, "info", `Sub2API noRT 入库阶段: ${itemIndex + 1}/${collected.length} ${item.workspaceId}`);
+    await upsertAndExportNoRtWorkspaceToken(task, email, item.accessToken, "gpt-k12-nort-session-exchange");
+  }
+  appendLog(task, "ok", `Sub2API noRT 入库阶段完成: ${collected.length}/${workspaceIds.length}`);
+  return collected.at(-1)?.accessToken || baseAccessToken;
 }
 
 async function upsertAndExportNoRtWorkspaceToken(
@@ -6071,13 +6172,14 @@ async function runTask(task: K12Task): Promise<void> {
         if (workspaceIds.length > 1) {
           accessToken = await runNoRtWorkspaceBatchTwoPhase(client, task, email, baseAccessToken, workspaceIds);
         } else if (workspaceIds.length) {
+          appendLog(task, "info", "noRT workspace token 模式: chatgpt session exchange, 禁用 auth callback workspace 切换");
           appendLog(task, "info", `Sub2API noRT 批处理模式：一次登录后顺序处理 ${workspaceIds.length} 个 workspace`);
           for (let workspaceIndex = 0; workspaceIndex < workspaceIds.length; workspaceIndex += 1) {
             assertNotCanceled(task);
             const workspaceId = workspaceIds[workspaceIndex];
             appendLog(task, "info", `开始 workspace ${workspaceIndex + 1}/${workspaceIds.length}: ${workspaceId}`);
-            const workspaceToken = await runK12WorkspaceJoinForWorkspace(client, task, email, baseAccessToken, workspaceId);
-            await upsertAndExportNoRtWorkspaceToken(task, email, workspaceToken, "gpt-k12-nort");
+            const workspaceToken = await runK12WorkspaceJoinAndExchangeForWorkspace(client, task, email, baseAccessToken, workspaceId);
+            await upsertAndExportNoRtWorkspaceToken(task, email, workspaceToken, "gpt-k12-nort-session-exchange");
             accessToken = workspaceToken;
           }
         } else {
@@ -6157,12 +6259,13 @@ async function runTask(task: K12Task): Promise<void> {
       const baseAccessToken = accessToken;
       const workspaceIds = targetK12WorkspaceIds(task);
       if (workspaceIds.length) {
+        appendLog(task, "info", "JSON-only workspace token 模式: chatgpt session exchange, 禁用 auth callback workspace 切换");
         appendLog(task, "info", `JSON-only 批处理模式：一次登录后顺序导出 ${workspaceIds.length} 个 workspace`);
         for (let workspaceIndex = 0; workspaceIndex < workspaceIds.length; workspaceIndex += 1) {
           assertNotCanceled(task);
           const workspaceId = workspaceIds[workspaceIndex];
           appendLog(task, "info", `开始导出 workspace ${workspaceIndex + 1}/${workspaceIds.length}: ${workspaceId}`);
-          const workspaceToken = await runK12WorkspaceJoinForWorkspace(client, task, email, baseAccessToken, workspaceId);
+          const workspaceToken = await runK12WorkspaceJoinAndExchangeForWorkspace(client, task, email, baseAccessToken, workspaceId);
           await exportJsonOnlyWorkspaceToken(task, email, workspaceToken, workspaceId);
           accessToken = workspaceToken;
         }
@@ -6630,7 +6733,9 @@ function retryTask(source: K12Task): K12Task {
   appendLog(
     task,
     "info",
-    sourceWorkspaceIds.length > 1
+    source.sub2apiNoRtMode === true && source.runSub2Api && sourceWorkspaceIds.length > 1
+      ? `重试任务，来源: ${source.id}；noRT 模式将重新 session exchange、upsert 并覆盖 JSON，处理 ${retryWorkspaceIds.length}/${sourceWorkspaceIds.length}: ${retryWorkspaceIds.join(", ")}`
+      : sourceWorkspaceIds.length > 1
       ? `重试任务，来源: ${source.id}；自动跳过已有 JSON 的 workspace，剩余 ${retryWorkspaceIds.length}/${sourceWorkspaceIds.length}: ${retryWorkspaceIds.join(", ")}`
       : `重试任务，来源: ${source.id}`,
   );
