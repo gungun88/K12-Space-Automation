@@ -3487,20 +3487,21 @@ function extractChatGptSessionAccessToken(payload: unknown): string {
   throw new Error("ChatGPT session exchange 响应缺少 accessToken/access_token/tokens.access_token");
 }
 
-async function exchangeChatGptWorkspaceSessionToken(
+async function exchangeChatGptSessionTokenForAccount(
   client: any,
   task: K12Task,
-  workspaceId: string,
+  accountId: string,
+  label: string,
 ): Promise<string> {
-  const normalizedWorkspaceId = normalizeWorkspaceId(workspaceId);
-  if (!normalizedWorkspaceId) {
-    throw new Error(`workspace_id 格式无效，无法 session exchange: ${workspaceId}`);
+  const normalizedAccountId = normalizeWorkspaceId(accountId);
+  if (!normalizedAccountId) {
+    throw new Error(`workspace_id 格式无效，无法 session exchange: ${accountId}`);
   }
 
-  appendLog(task, "info", `使用 ChatGPT session exchange 获取 workspace AT: ${normalizedWorkspaceId.slice(0, 8)}...`);
+  appendLog(task, "info", `使用 ChatGPT session exchange 获取 ${label}: ${normalizedAccountId.slice(0, 8)}...`);
   const url = new URL(`${CHATGPT_BASE_URL}/api/auth/session`);
   url.searchParams.set("exchange_workspace_token", "true");
-  url.searchParams.set("workspace_id", normalizedWorkspaceId);
+  url.searchParams.set("workspace_id", normalizedAccountId);
   url.searchParams.set("reason", "setCurrentAccount");
 
   const response = await client.fetch(url.toString(), {
@@ -3515,27 +3516,91 @@ async function exchangeChatGptWorkspaceSessionToken(
   });
   const text = await response.text().catch(() => "");
   if (!response.ok) {
-    throw new Error(`ChatGPT session exchange 失败 workspace=${normalizedWorkspaceId}: HTTP ${response.status}: ${text.slice(0, 500)}`);
+    throw new Error(`ChatGPT session exchange 失败 workspace=${normalizedAccountId}: HTTP ${response.status}: ${text.slice(0, 500)}`);
   }
 
   let payload: unknown;
   try {
     payload = JSON.parse(text) as unknown;
   } catch {
-    throw new Error(`ChatGPT session exchange 非 JSON 响应 workspace=${normalizedWorkspaceId}: ${text.slice(0, 500)}`);
+    throw new Error(`ChatGPT session exchange 非 JSON 响应 workspace=${normalizedAccountId}: ${text.slice(0, 500)}`);
   }
 
   const accessToken = extractChatGptSessionAccessToken(payload);
   const jwtPayload = decodeJwtPayload(accessToken);
   const tokenWorkspaceId = jwtChatGptAccountId(jwtPayload);
-  if (!sameWorkspaceId(tokenWorkspaceId, normalizedWorkspaceId)) {
+  if (!sameWorkspaceId(tokenWorkspaceId, normalizedAccountId)) {
     throw new Error(
-      `ChatGPT session exchange 返回的 AT workspace 不匹配: expected=${normalizedWorkspaceId}, actual=${tokenWorkspaceId || "?"}, ${describeAccessTokenContext(accessToken)}`,
+      `ChatGPT session exchange 返回的 AT workspace 不匹配: expected=${normalizedAccountId}, actual=${tokenWorkspaceId || "?"}, ${describeAccessTokenContext(accessToken)}`,
     );
   }
 
-  appendLog(task, "ok", `session exchange 已确认 workspace AT: ${normalizedWorkspaceId.slice(0, 8)}...`);
+  appendLog(task, "ok", `session exchange 已确认 ${label}: ${normalizedAccountId.slice(0, 8)}...`);
   return accessToken;
+}
+
+async function exchangeChatGptWorkspaceSessionToken(
+  client: any,
+  task: K12Task,
+  workspaceId: string,
+): Promise<string> {
+  return exchangeChatGptSessionTokenForAccount(client, task, workspaceId, "workspace AT");
+}
+
+function isLoginBaseAccessToken(task: K12Task, accessToken: string): boolean {
+  const info = summarizeToken(accessToken);
+  const accountId = normalizeWorkspaceId(info.accountId);
+  if (!accountId) return false;
+  if (info.planType.trim().toLowerCase() === "k12") return false;
+  return !authWorkspaceTargetIdSet(task).has(accountId.toLowerCase());
+}
+
+function resolveLoginBaseWorkspaceId(task: K12Task, email: EmailRecord, baseAccessToken: string): string {
+  const tokenAccountId = normalizeWorkspaceId(summarizeToken(baseAccessToken).accountId);
+  if (tokenAccountId && isLoginBaseAccessToken(task, baseAccessToken)) return tokenAccountId;
+
+  const cached = normalizeWorkspaceId(email.loginBaseWorkspaceId);
+  if (cached && !authWorkspaceTargetIdSet(task).has(cached.toLowerCase()) && !isInvalidAuthWorkspaceId(email, cached)) {
+    return cached;
+  }
+
+  throw new Error(
+    "无法恢复 ChatGPT 当前账户到个人/free：缺少可用个人/free workspace id。已阻止 noRT 持久化，避免导出后停留在 K12 workspace 导致批量 401。",
+  );
+}
+
+async function restoreChatGptCurrentAccountToLoginBase(
+  client: any,
+  task: K12Task,
+  email: EmailRecord,
+  baseAccessToken: string,
+  reason: string,
+): Promise<string> {
+  const baseWorkspaceId = resolveLoginBaseWorkspaceId(task, email, baseAccessToken);
+  appendLog(task, "info", `恢复 ChatGPT 当前账户到个人/free (${reason}): ${baseWorkspaceId.slice(0, 8)}...`);
+  const restoredToken = await exchangeChatGptSessionTokenForAccount(client, task, baseWorkspaceId, "个人/free AT");
+  if (!isLoginBaseAccessToken(task, restoredToken)) {
+    throw new Error(`恢复个人/free 后仍不是安全上下文: ${describeAccessTokenContext(restoredToken)}`);
+  }
+  await cacheLoginBaseWorkspaceFromAccessToken(email, task, restoredToken);
+  appendLog(task, "ok", `已恢复 ChatGPT 当前账户到个人/free: ${baseWorkspaceId.slice(0, 8)}...`);
+  return restoredToken;
+}
+
+async function assertNoRtWorkspaceTokenAliveAfterBaseRestore(
+  task: K12Task,
+  workspaceId: string,
+  accessToken: string,
+): Promise<void> {
+  if (!isAccessTokenForWorkspace(accessToken, workspaceId)) {
+    throw new Error(`noRT workspace AT 不匹配，已阻止写入: expected=${workspaceId}, ${describeAccessTokenContext(accessToken)}`);
+  }
+  appendLog(task, "info", `noRT AT 恢复个人/free 后测活: ${workspaceId.slice(0, 8)}...`);
+  const result = await testOpenAiAccessToken(accessToken);
+  if (!result.ok) {
+    throw new Error(`noRT AT 恢复个人/free 后测活失败，已阻止写入 Sub2API/JSON: ${workspaceId.slice(0, 8)}... ${result.message}`);
+  }
+  appendLog(task, "ok", `noRT AT 恢复个人/free 后测活通过: ${workspaceId.slice(0, 8)}... ${result.message}`);
 }
 
 function findWorkspaceInAccountsCheck(payload: unknown, workspaceId: string): Record<string, unknown> | null {
@@ -6007,8 +6072,6 @@ async function runK12WorkspaceJoinAndExchangeForWorkspace(
   await runK12WorkspaceInviteForWorkspace(client, task, baseAccessToken, workspaceId, {email});
   await checkK12WorkspaceMembership(client, task, baseAccessToken, workspaceId, email);
   const workspaceToken = await exchangeChatGptWorkspaceSessionToken(client, task, workspaceId);
-  recordAccessToken(task, email, workspaceToken);
-  await appendTokenOut(workspaceToken);
   return workspaceToken;
 }
 
@@ -6091,6 +6154,7 @@ async function runNoRtWorkspaceBatchTwoPhase(
   }
 
   appendLog(task, "info", "noRT workspace token 模式: chatgpt session exchange, 禁用 auth callback workspace 切换");
+  appendLog(task, "info", "noRT 安全策略: 导出后恢复个人/free, 禁止 logout");
   appendLog(task, "info", `Sub2API noRT 批处理模式：阶段 1 集中申请 ${workspaceIds.length} 个 workspace`);
   await refreshVisibleWorkspacesFromAccountsCheck(client, task, email, baseAccessToken, "K12 申请阶段开始");
   for (let workspaceIndex = 0; workspaceIndex < workspaceIds.length; workspaceIndex += 1) {
@@ -6109,17 +6173,27 @@ async function runNoRtWorkspaceBatchTwoPhase(
     appendLog(task, "info", `K12 token exchange 阶段: ${workspaceIndex + 1}/${workspaceIds.length} ${workspaceId}`);
     await checkK12WorkspaceMembership(client, task, baseAccessToken, workspaceId, email);
     const workspaceToken = await exchangeChatGptWorkspaceSessionToken(client, task, workspaceId);
-    recordAccessToken(task, email, workspaceToken);
-    await appendTokenOut(workspaceToken);
+    await restoreChatGptCurrentAccountToLoginBase(client, task, email, baseAccessToken, `workspace ${workspaceIndex + 1}/${workspaceIds.length} 导出后`);
+    await assertNoRtWorkspaceTokenAliveAfterBaseRestore(task, workspaceId, workspaceToken);
     collected.push({workspaceId, accessToken: workspaceToken});
   }
   appendLog(task, "ok", `K12 token exchange 阶段完成: ${collected.length}/${workspaceIds.length}`);
+
+  await restoreChatGptCurrentAccountToLoginBase(client, task, email, baseAccessToken, "批量入库前最终确认");
+  appendLog(task, "info", `Sub2API noRT 批处理模式：阶段 2.5 恢复个人/free 后最终测活 ${collected.length} 个 workspace AT`);
+  for (let itemIndex = 0; itemIndex < collected.length; itemIndex += 1) {
+    assertNotCanceled(task);
+    const item = collected[itemIndex];
+    await assertNoRtWorkspaceTokenAliveAfterBaseRestore(task, item.workspaceId, item.accessToken);
+  }
 
   appendLog(task, "info", `Sub2API noRT 批处理模式：阶段 3 统一 upsert 并覆盖写出 JSON ${collected.length} 个 workspace`);
   for (let itemIndex = 0; itemIndex < collected.length; itemIndex += 1) {
     assertNotCanceled(task);
     const item = collected[itemIndex];
     appendLog(task, "info", `Sub2API noRT 入库阶段: ${itemIndex + 1}/${collected.length} ${item.workspaceId}`);
+    recordAccessToken(task, email, item.accessToken);
+    await appendTokenOut(item.accessToken);
     await upsertAndExportNoRtWorkspaceToken(task, email, item.accessToken, "gpt-k12-nort-session-exchange");
   }
   appendLog(task, "ok", `Sub2API noRT 入库阶段完成: ${collected.length}/${workspaceIds.length}`);
@@ -6192,11 +6266,14 @@ async function runTask(task: K12Task): Promise<void> {
   clearTaskErrorState(task, email);
   await Promise.all([persistTasks(), persistEmails()]);
 
+  let client: any | undefined;
+  let baseAccessTokenForWorkspaceRestore = "";
+  let workspaceSessionRestoreRequired = false;
   try {
     process.env.OPENAI_FETCH_TIMEOUT_MS = String(appConfig.openaiFetchTimeoutMs);
     await ensureSentinelSdk();
 
-    const client = await createOpenAIClientForEmail(task, email);
+    client = await createOpenAIClientForEmail(task, email);
     const useNoRtMode = task.sub2apiNoRtMode === true;
 
     let accessToken = "";
@@ -6223,16 +6300,25 @@ async function runTask(task: K12Task): Promise<void> {
 
         const baseAccessToken = accessToken;
         const workspaceIds = task.runWorkspaceJoin ? targetK12WorkspaceIds(task) : [];
+        if (workspaceIds.length) {
+          baseAccessTokenForWorkspaceRestore = baseAccessToken;
+          workspaceSessionRestoreRequired = true;
+        }
         if (workspaceIds.length > 1) {
           accessToken = await runNoRtWorkspaceBatchTwoPhase(client, task, email, baseAccessToken, workspaceIds);
         } else if (workspaceIds.length) {
           appendLog(task, "info", "noRT workspace token 模式: chatgpt session exchange, 禁用 auth callback workspace 切换");
+          appendLog(task, "info", "noRT 安全策略: 导出后恢复个人/free, 禁止 logout");
           appendLog(task, "info", `Sub2API noRT 批处理模式：一次登录后顺序处理 ${workspaceIds.length} 个 workspace`);
           for (let workspaceIndex = 0; workspaceIndex < workspaceIds.length; workspaceIndex += 1) {
             assertNotCanceled(task);
             const workspaceId = workspaceIds[workspaceIndex];
             appendLog(task, "info", `开始 workspace ${workspaceIndex + 1}/${workspaceIds.length}: ${workspaceId}`);
             const workspaceToken = await runK12WorkspaceJoinAndExchangeForWorkspace(client, task, email, baseAccessToken, workspaceId);
+            await restoreChatGptCurrentAccountToLoginBase(client, task, email, baseAccessToken, `workspace ${workspaceIndex + 1}/${workspaceIds.length} 导出后`);
+            await assertNoRtWorkspaceTokenAliveAfterBaseRestore(task, workspaceId, workspaceToken);
+            recordAccessToken(task, email, workspaceToken);
+            await appendTokenOut(workspaceToken);
             await upsertAndExportNoRtWorkspaceToken(task, email, workspaceToken, "gpt-k12-nort-session-exchange");
             accessToken = workspaceToken;
           }
@@ -6313,13 +6399,20 @@ async function runTask(task: K12Task): Promise<void> {
       const baseAccessToken = accessToken;
       const workspaceIds = targetK12WorkspaceIds(task);
       if (workspaceIds.length) {
+        baseAccessTokenForWorkspaceRestore = baseAccessToken;
+        workspaceSessionRestoreRequired = true;
         appendLog(task, "info", "JSON-only workspace token 模式: chatgpt session exchange, 禁用 auth callback workspace 切换");
+        appendLog(task, "info", "noRT 安全策略: 导出后恢复个人/free, 禁止 logout");
         appendLog(task, "info", `JSON-only 批处理模式：一次登录后顺序导出 ${workspaceIds.length} 个 workspace`);
         for (let workspaceIndex = 0; workspaceIndex < workspaceIds.length; workspaceIndex += 1) {
           assertNotCanceled(task);
           const workspaceId = workspaceIds[workspaceIndex];
           appendLog(task, "info", `开始导出 workspace ${workspaceIndex + 1}/${workspaceIds.length}: ${workspaceId}`);
           const workspaceToken = await runK12WorkspaceJoinAndExchangeForWorkspace(client, task, email, baseAccessToken, workspaceId);
+          await restoreChatGptCurrentAccountToLoginBase(client, task, email, baseAccessToken, `JSON-only workspace ${workspaceIndex + 1}/${workspaceIds.length} 导出后`);
+          await assertNoRtWorkspaceTokenAliveAfterBaseRestore(task, workspaceId, workspaceToken);
+          recordAccessToken(task, email, workspaceToken);
+          await appendTokenOut(workspaceToken);
           await exportJsonOnlyWorkspaceToken(task, email, workspaceToken, workspaceId);
           accessToken = workspaceToken;
         }
@@ -6334,6 +6427,10 @@ async function runTask(task: K12Task): Promise<void> {
         accountName: task.sub2apiAccount || email.sub2apiAccount,
         source: jsonSource,
       });
+    }
+
+    if (workspaceSessionRestoreRequired && client && baseAccessTokenForWorkspaceRestore) {
+      await restoreChatGptCurrentAccountToLoginBase(client, task, email, baseAccessTokenForWorkspaceRestore, "任务成功前最终确认");
     }
 
     markTaskSuccess(task, email);
@@ -6354,6 +6451,13 @@ async function runTask(task: K12Task): Promise<void> {
       appendLog(task, task.status === "canceled" ? "warn" : "error", message);
     }
   } finally {
+    if (workspaceSessionRestoreRequired && client && baseAccessTokenForWorkspaceRestore) {
+      try {
+        await restoreChatGptCurrentAccountToLoginBase(client, task, email, baseAccessTokenForWorkspaceRestore, "任务结束兜底");
+      } catch (error) {
+        appendLog(task, "warn", `任务结束恢复个人/free 失败: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
     cancelManualEmailOtp(task.id, "任务已结束，手动验证码等待关闭");
     if ((task.status as TaskStatus) === "queued") {
       task.startedAt = undefined;
