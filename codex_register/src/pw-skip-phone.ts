@@ -33,9 +33,23 @@ function pkceCodeChallenge(verifier: string): string {
     return crypto.createHash("sha256").update(verifier).digest("base64url");
 }
 
+function browserLaunchArgs(): string[] {
+    const configured = String(process.env.SENTINEL_BROWSER_ARGS || "")
+        .split(/[,\r\n]+/)
+        .map((item) => item.trim())
+        .filter(Boolean);
+    if (configured.length) return configured;
+    return process.platform === "linux" ? ["--no-sandbox", "--disable-dev-shm-usage"] : [];
+}
+
 function resolveBrowserPath(): string {
     const candidates = [
         process.env.SENTINEL_BROWSER_PATH,
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+        "/usr/bin/google-chrome-stable",
+        "/usr/bin/google-chrome",
+        "/snap/bin/chromium",
         "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
         "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
         "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
@@ -117,6 +131,7 @@ async function main() {
             username: decodeURIComponent(proxyUrl.username),
             password: decodeURIComponent(proxyUrl.password),
         },
+        args: browserLaunchArgs(),
     });
 
     const context = await browser.newContext({

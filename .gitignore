@@ -12,6 +12,7 @@ k12-basic-auth*
 config.json
 .env
 .env.*
+!.env.example
 *.pem
 *.key
 *.crt

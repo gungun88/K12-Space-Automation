@@ -1,0 +1,35 @@
+services:
+  k12-space-automation:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: k12-space-automation
+    restart: unless-stopped
+    init: true
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: ${APP_PORT:-8796}
+      TZ: ${TZ:-Asia/Shanghai}
+      SENTINEL_BROWSER_PATH: ${SENTINEL_BROWSER_PATH:-/usr/bin/chromium}
+      SENTINEL_BROWSER_ARGS: ${SENTINEL_BROWSER_ARGS:---no-sandbox,--disable-dev-shm-usage}
+    ports:
+      - "127.0.0.1:${APP_PORT:-8796}:8796"
+    volumes:
+      - ./data:/app/data
+      - ./json:/app/json
+      - ./auth:/app/auth
+      - ./.web-data:/app/.web-data
+      - ./config.json:/app/config.json
+      - ./codex_register/config.json:/app/codex_register/config.json
+      - ./pool_tokens.txt:/app/pool_tokens.txt
+      - ./2925-account.json:/app/2925-account.json
+    shm_size: "1gb"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8796/api/health').then((res)=>process.exit(res.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 45s
