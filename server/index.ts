@@ -506,7 +506,14 @@ async function writeJson(filePath: string, value: unknown): Promise<void> {
     const tempFile = path.join(dir, `.${path.basename(filePath)}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`);
     try {
       await writeFile(tempFile, `${JSON.stringify(value, null, 2)}\n`, "utf8");
-      await rename(tempFile, filePath);
+      try {
+        await rename(tempFile, filePath);
+      } catch (error) {
+        const code = error instanceof Error && "code" in error ? String((error as NodeJS.ErrnoException).code || "") : "";
+        if (!["EBUSY", "EXDEV", "EPERM"].includes(code)) throw error;
+        await writeFile(filePath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+        await unlink(tempFile).catch(() => undefined);
+      }
     } catch (error) {
       await unlink(tempFile).catch(() => undefined);
       throw error;
