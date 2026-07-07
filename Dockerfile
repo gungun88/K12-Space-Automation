@@ -13,8 +13,6 @@ COPY package.json package-lock.json ./
 RUN npm ci --omit=dev && npm cache clean --force
 
 FROM node:22-bookworm-slim AS runner
-ARG APP_UID=1000
-ARG APP_GID=1000
 ENV NODE_ENV=production
 ENV HOST=0.0.0.0
 ENV PORT=8796
@@ -29,9 +27,6 @@ RUN apt-get update \
         dumb-init \
     && rm -rf /var/lib/apt/lists/*
 
-RUN groupadd --gid ${APP_GID} app \
-    && useradd --uid ${APP_UID} --gid ${APP_GID} --create-home --home-dir /home/app app
-
 COPY --from=prod-deps /app/node_modules ./node_modules
 COPY --from=builder /app/dist ./dist
 COPY --from=builder /app/server ./server
@@ -41,9 +36,9 @@ COPY --from=builder /app/package.json ./package.json
 
 RUN mkdir -p /app/data /app/json /app/auth /app/.web-data /app/codex_register \
     && touch /app/pool_tokens.txt /app/2925-account.json \
-    && chown -R app:app /app /home/app
+    && chown -R node:node /app /home/node
 
-USER app
+USER node
 EXPOSE 8796
 
 ENTRYPOINT ["dumb-init", "--"]
